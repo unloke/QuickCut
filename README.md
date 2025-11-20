@@ -1,0 +1,2 @@
+# QuickCut
+fast video editor
