@@ -1,0 +1,13 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="17.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <CustomBuild Include="D:\吳冠頡\剪輯\quickcut\backend\audio_analyzer\build\CMakeFiles\261168a77b98c85438f832f24c58b328\generate.stamp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+  </ItemGroup>
+  <ItemGroup>
+    <Filter Include="CMake Rules">
+      <UniqueIdentifier>{41DCE976-7CEC-3F69-A950-144609AC0522}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+</Project>

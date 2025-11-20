@@ -1,0 +1,3 @@
+D:/吳冠頡/剪輯/quickcut/backend/audio_analyzer/build/CMakeFiles/audio_analyzer.dir
+D:/吳冠頡/剪輯/quickcut/backend/audio_analyzer/build/CMakeFiles/ALL_BUILD.dir
+D:/吳冠頡/剪輯/quickcut/backend/audio_analyzer/build/CMakeFiles/ZERO_CHECK.dir

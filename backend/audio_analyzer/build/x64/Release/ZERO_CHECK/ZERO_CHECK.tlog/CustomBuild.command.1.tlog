@@ -1,0 +1,10 @@
+^D:\吳冠頡\剪輯\QUICKCUT\BACKEND\AUDIO_ANALYZER\BUILD\CMAKEFILES\261168A77B98C85438F832F24C58B328\GENERATE.STAMP.RULE
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -SD:/吳冠頡/剪輯/quickcut/backend/audio_analyzer -BD:/吳冠頡/剪輯/quickcut/backend/audio_analyzer/build --check-stamp-list CMakeFiles/generate.stamp.list --vs-solution-file D:/吳冠頡/剪輯/quickcut/backend/audio_analyzer/build/audio_analyzer.sln
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd

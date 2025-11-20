@@ -1,0 +1,10 @@
+^D:\吳冠頡\剪輯\QUICKCUT\BACKEND\AUDIO_ANALYZER\CMAKELISTS.TXT
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -SD:/吳冠頡/剪輯/quickcut/backend/audio_analyzer -BD:/吳冠頡/剪輯/quickcut/backend/audio_analyzer/build --check-stamp-file D:/吳冠頡/剪輯/quickcut/backend/audio_analyzer/build/CMakeFiles/generate.stamp
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
