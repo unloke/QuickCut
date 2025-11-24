@@ -5,6 +5,9 @@ import sys
 from functools import partial
 from pathlib import Path
 
+# Add backend to path
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "backend"))
+
 # Ensure Qt uses the Media Foundation backend before importing PyQt modules.
 os.environ.setdefault("QT_MULTIMEDIA_PREFERRED_PLUGINS", "windowsmediafoundation")
 
@@ -27,6 +30,7 @@ from PyQt5.QtWidgets import (
 )
 
 from .exporter import export_visible_segments
+from backend.exporter_xml import export_to_xml, export_to_edl
 from .models import (
     AnalysisResult,
     ClipRegion,
@@ -37,7 +41,7 @@ from .models import (
 )
 from .pipeline import AnalyzerPipeline
 from .timeline_builder import build_regions
-from .transcription import TranscriptionEngine
+from .transcription import VoskTranscriber
 from .widgets.media_bin import MediaBinWidget
 from .widgets.preview import PreviewPanel
 from .widgets.quick_panel import QuickEditPanel
@@ -109,15 +113,36 @@ def _discover_analyzer_binary() -> Path:
     raise FileNotFoundError("找不到 audio_analyzer，可先執行 CMake 建置。")
 
 
+def _discover_vosk_model() -> Path:
+    """Discovers the directory containing Vosk model files"""
+    env_path = os.environ.get("VOSK_MODEL_DIR")
+    if env_path:
+        candidate = Path(env_path)
+        if candidate.exists():
+            return candidate
+
+    base_dir = Path(__file__).resolve().parents[2]
+    vosk_dir = base_dir / "models" / "sherpa" / "vosk-model-small-en-us-0.15"
+
+    if vosk_dir.exists():
+        return vosk_dir
+
+    raise FileNotFoundError(
+        "找不到 Vosk 模型。\n"
+        f"請確保 '{vosk_dir}' 目錄存在。\n"
+        "建議使用模型: vosk-model-small-en-us-0.15"
+    )
+
 class QuickCutWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("QuickCut Whisper")
+        self.setWindowTitle("QuickCut")
         self.resize(1280, 780)
 
         analyzer_path = _discover_analyzer_binary()
+        vosk_model = _discover_vosk_model()
         self.pipeline = AnalyzerPipeline(analyzer_path)
-        self.transcriber = TranscriptionEngine("tiny")
+        self.transcriber = VoskTranscriber(vosk_model)
         self.project: ProjectState | None = None
         self.current_media_path: Path | None = None
         self.current_settings = QuickEditSettings()
@@ -197,7 +222,7 @@ class QuickCutWindow(QMainWindow):
         if self._has_manual_edits and self.project:
             self._set_status("設定已變更，請按「分析」重新套用至手動編輯後的片段。")
             return
-        if self.project and self.project.analysis and self.project.transcription:
+        if self.project and self.project.analysis:
             self.project.regions = build_regions(
                 self.project.analysis,
                 self.project.transcription,
@@ -291,21 +316,36 @@ class QuickCutWindow(QMainWindow):
         if not self.project or not self.project.regions:
             QMessageBox.information(self, "無內容", "請先完成分析。")
             return
-        save_path, _ = QFileDialog.getSaveFileName(
+        save_path, selected_filter = QFileDialog.getSaveFileName(
             self,
-            "輸出影片",
+            "輸出",
             str(self.project.analysis.media_path.with_stem(self.project.analysis.media_path.stem + "_quickcut")),
-            "MP4 (*.mp4)",
+            "MP4 (*.mp4);;XML (*.xml);;EDL (*.edl)",
         )
         if not save_path:
             return
         try:
-            export_visible_segments(
-                self.project.analysis.media_path,
-                self.project.regions,
-                Path(save_path),
-                progress_cb=self._set_status,
-            )
+            if "MP4" in selected_filter:
+                export_visible_segments(
+                    self.project.analysis.media_path,
+                    self.project.regions,
+                    Path(save_path),
+                    progress_cb=self._set_status,
+                )
+            elif "XML" in selected_filter:
+                audio_crossfade_duration = 0.5 if self.current_settings.add_audio_crossfades else 0.0
+                export_to_xml(
+                    self.project.regions,
+                    Path(save_path),
+                    self.project.analysis.media_path,
+                    audio_crossfade_duration=audio_crossfade_duration,
+                )
+            elif "EDL" in selected_filter:
+                export_to_edl(
+                    self.project.regions,
+                    Path(save_path),
+                    self.project.analysis.media_path,
+                )
             self._set_status("輸出完成。")
             QMessageBox.information(self, "完成", f"已輸出到 {save_path}")
         except Exception as exc:
@@ -440,21 +480,27 @@ class QuickCutWindow(QMainWindow):
             return
         self._syncing_timeline_scroll = True
         try:
-            if total <= 0 or span >= total:
+            if total <= 0 or span <= 0 or span >= total:
                 self.timeline_scroll.setEnabled(False)
+                self.timeline_scroll.setRange(0, 0)
                 self.timeline_scroll.setValue(0)
             else:
                 max_start = total - span
-                ratio = 0.0 if max_start <= 0 else max(0.0, min(1.0, start / max_start))
+                max_start_ms = int(round(max_start * 1000))
+                start_ms = int(round(start * 1000))
+                clamped_value = max(0, min(start_ms, max_start_ms))
                 self.timeline_scroll.setEnabled(True)
-                self.timeline_scroll.setValue(int(ratio * 1000))
+                self.timeline_scroll.setRange(0, max_start_ms)
+                self.timeline_scroll.setSingleStep(1)
+                self.timeline_scroll.setPageStep(max(1, int(round(span * 1000))))
+                self.timeline_scroll.setValue(clamped_value)
         finally:
             self._syncing_timeline_scroll = False
 
     def _handle_timeline_scroll_changed(self, value: int):
         if self._syncing_timeline_scroll:
             return
-        self.timeline.set_view_start_ratio(value / 1000.0)
+        self.timeline.set_view_start_time(value / 1000.0)
 
     def _build_timeline_controls(self) -> QWidget:
         toolbar = QWidget()
@@ -472,7 +518,7 @@ class QuickCutWindow(QMainWindow):
 
         layout.addWidget(QLabel("時間軸滑動："))
         self.timeline_scroll = QSlider(Qt.Orientation.Horizontal)
-        self.timeline_scroll.setRange(0, 1000)
+        self.timeline_scroll.setRange(0, 0)
         self.timeline_scroll.setEnabled(False)
         self.timeline_scroll.valueChanged.connect(self._handle_timeline_scroll_changed)
         layout.addWidget(self.timeline_scroll, stretch=1)
@@ -585,7 +631,10 @@ class QuickCutWindow(QMainWindow):
                     f"選擇 {self._format_seconds(region.start)} ~ {self._format_seconds(region.end)} ｜ {label}"
                 )
         if region and sync_preview:
-            self.preview.set_playhead(region.start)
+            preroll_ms = 80 if region.duration < 1.0 else 0
+            if preroll_ms:
+                self._skip_hidden_seek = True
+            self.preview.set_playhead(region.start, preroll_ms=preroll_ms)
         self._update_editing_actions()
 
     def _update_editing_actions(self):
@@ -596,6 +645,13 @@ class QuickCutWindow(QMainWindow):
         can_toggle = bool(region)
         self.cut_button.setEnabled(can_cut)
         self.toggle_visibility_button.setEnabled(can_toggle)
+        if region and not can_cut:
+            self.cut_button.setToolTip("片段長度需超過 0.05 秒才能切割。")
+        elif region:
+            self.cut_button.setToolTip("在播放頭位置切割選擇片段。")
+        else:
+            self.cut_button.setToolTip("請先選擇片段。")
+        self.toggle_visibility_button.setToolTip("切換選擇片段的顯示狀態。")
         if region:
             if region.visible:
                 self.toggle_visibility_button.setText("隱藏 (Ctrl+Shift+T)")
@@ -622,13 +678,12 @@ class QuickCutWindow(QMainWindow):
 
     def _apply_transcript_split(self, region: ClipRegion, new_region: ClipRegion, split_time: float) -> bool:
         transcript: TranscriptSegment | None = region.metadata.get("transcript")
-        if not transcript or not transcript.characters:
+        if not transcript:
             return False
         left_seg = transcript.slice(transcript.start, split_time)
         right_seg = transcript.slice(split_time, transcript.end)
-        if not left_seg or not right_seg or not left_seg.characters or not right_seg.characters:
+        if not left_seg or not right_seg:
             return False
-
         region.metadata["transcript"] = left_seg
         new_region.metadata["transcript"] = right_seg
         region.text = left_seg.text

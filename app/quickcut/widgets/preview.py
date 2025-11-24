@@ -137,9 +137,10 @@ class VLCPreviewWidget(QWidget):
             position = position_ms / self._duration_ms
             self.player.set_position(position)
 
-    def set_playhead(self, seconds: float):
+    def set_playhead(self, seconds: float, preroll_ms: int = 0):
         if self._duration_ms > 0:
-            position = seconds * 1000 / self._duration_ms
+            target_ms = max(0.0, seconds * 1000.0 - max(0, preroll_ms))
+            position = target_ms / self._duration_ms
             self.player.set_position(position)
 
     def _on_position_changed(self, event):
@@ -193,6 +194,7 @@ class PreviewPanel(QFrame):
         self.play_button = QPushButton("播放 / 暫停")
         controls.addWidget(self.play_button)
         self.slider = QSlider(Qt.Orientation.Horizontal)
+        self.slider.setSingleStep(1)
         controls.addWidget(self.slider, stretch=1)
         layout.addLayout(controls)
 
@@ -200,12 +202,13 @@ class PreviewPanel(QFrame):
         self.qt_player = QMediaPlayer(self, QMediaPlayer.VideoSurface)
         self.qt_player.setVideoOutput(self.qt_video_widget)
         self.qt_player.setVolume(50)  # Set volume to 50%
+        self.qt_player.setNotifyInterval(15)
 
         self.play_button.clicked.connect(self.toggle_playback)
         self.slider.sliderMoved.connect(self._seek)
 
-        self.qt_player.positionChanged.connect(self._handle_position_changed)
-        self.qt_player.durationChanged.connect(self._handle_duration_changed)
+        self.qt_player.positionChanged.connect(lambda pos: self._handle_position_changed(pos / 1000.0))
+        self.qt_player.durationChanged.connect(lambda dur: self._handle_duration_changed(dur / 1000.0))
         self.qt_player.error.connect(self._handle_qt_error)
 
         self._duration_ms = 0
@@ -270,15 +273,17 @@ class PreviewPanel(QFrame):
         else:
             self.qt_player.pause()
 
-    def _handle_position_changed(self, position_ms: int):
+    def _handle_position_changed(self, position_s: float):
+        position_ms = int(round(position_s * 1000))
         if not self.slider.isSliderDown():
             self.slider.setValue(position_ms)
-        self.positionUpdated.emit(position_ms / 1000.0)
+        self.positionUpdated.emit(position_s)
 
-    def _handle_duration_changed(self, duration_ms: int):
-        self._duration_ms = duration_ms
-        self.slider.setRange(0, max(duration_ms, 1))
-        self.durationUpdated.emit(duration_ms / 1000.0)
+    def _handle_duration_changed(self, duration_s: float):
+        self._duration_ms = int(round(duration_s * 1000))
+        self.slider.setRange(0, max(self._duration_ms, 1))
+        self.slider.setPageStep(max(1, self._duration_ms // 20))
+        self.durationUpdated.emit(duration_s)
 
     def _handle_qt_error(self, error_code):
         if error_code == QMediaPlayer.Error.NoError:
@@ -348,8 +353,9 @@ class PreviewPanel(QFrame):
         else:
             self.qt_player.setPosition(position_ms)
 
-    def set_playhead(self, seconds: float):
+    def set_playhead(self, seconds: float, preroll_ms: int = 0):
+        position_ms = max(0, int(round(seconds * 1000)) - max(0, preroll_ms))
         if self._using_vlc and self.vlc_video_widget:
-            self.vlc_video_widget.set_playhead(seconds)
+            self.vlc_video_widget.set_playhead(seconds, preroll_ms=preroll_ms)
         else:
-            self.qt_player.setPosition(int(seconds * 1000))
+            self.qt_player.setPosition(position_ms)

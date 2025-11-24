@@ -1,25 +1,24 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import tempfile
-import wave
 from pathlib import Path
 from typing import Callable, List, Optional
-
-import numpy as np
 
 from .models import AnalysisResult, QuickEditSettings, Segment
 
 
 class AnalyzerPipeline:
-    """Coordinates FFmpeg extraction, C++ analyzer execution, and speech-only export."""
+    """Coordinates FFmpeg extraction and C++ analyzer execution."""
 
     def __init__(self, analyzer_executable: Path):
         self.analyzer_executable = Path(analyzer_executable)
         if not self.analyzer_executable.exists():
             raise FileNotFoundError(f"Audio analyzer binary not found: {self.analyzer_executable}")
+        self._audio_cache: dict[Path, tuple[int, int, Path]] = {}
 
     def analyze(
         self,
@@ -28,15 +27,27 @@ class AnalyzerPipeline:
         progress_cb: Optional[Callable[[str], None]] = None,
     ) -> AnalysisResult:
         media_path = Path(media_path)
-        if progress_cb:
-            progress_cb("抽取聲音中…")
-
-        cache_dir = Path(tempfile.mkdtemp(prefix="quickcut_"))
-        wav_path = cache_dir / "source.wav"
-        speech_wav_path = cache_dir / "speech_only.wav"
-
+        media_stat = media_path.stat()
+        cached_wav = self._get_cached_wav(media_path, media_stat)
+        cache_dir: Path | None = None
+        wav_path: Path
         try:
-            self._extract_audio(media_path, wav_path)
+            if cached_wav and cached_wav.exists():
+                wav_path = cached_wav
+                cache_dir = wav_path.parent
+                if progress_cb:
+                    progress_cb("使用快取的音訊檔…")
+            else:
+                if progress_cb:
+                    progress_cb("抽取聲音中…")
+                cache_dir = Path(tempfile.mkdtemp(prefix="quickcut_"))
+                wav_path = cache_dir / "source.wav"
+                self._extract_audio(media_path, wav_path)
+                self._audio_cache[media_path.resolve()] = (
+                    media_stat.st_size,
+                    int(media_stat.st_mtime),
+                    wav_path,
+                )
             if progress_cb:
                 progress_cb("執行 C++ 分析中…")
 
@@ -44,18 +55,13 @@ class AnalyzerPipeline:
             result = self._build_analysis_result(
                 payload,
                 media_path=media_path,
-                cache_dir=cache_dir,
+                cache_dir=cache_dir or wav_path.parent,
                 wav_path=wav_path,
-                speech_wav_path=speech_wav_path,
             )
-
-            if progress_cb:
-                progress_cb("產出僅保留語音的音檔…")
-
-            result.speech_time_map = self._render_speech_only_audio(result, speech_wav_path)
             return result
         except Exception:
-            shutil.rmtree(cache_dir, ignore_errors=True)
+            if cache_dir and cache_dir.exists() and not cached_wav:
+                shutil.rmtree(cache_dir, ignore_errors=True)
             raise
 
     def _extract_audio(self, media_path: Path, wav_path: Path) -> None:
@@ -90,7 +96,7 @@ class AnalyzerPipeline:
             "--low-db",
             f"{settings.low_energy_threshold_db}",
             "--min-silence",
-            f"{settings.min_silence}",
+            "0",
             "--min-speech",
             f"{settings.min_speech}",
             "--window-ms",
@@ -111,6 +117,23 @@ class AnalyzerPipeline:
             raise RuntimeError(data["error"])
         return data
 
+    def _get_cached_wav(self, media_path: Path, media_stat: Optional[os.stat_result]) -> Path | None:
+        key = media_path.resolve()
+        cached = self._audio_cache.get(key)
+        if not cached:
+            return None
+        size, mtime, wav_path = cached
+        if not wav_path.exists():
+            return None
+        if media_stat is None:
+            try:
+                media_stat = media_path.stat()
+            except OSError:
+                return None
+        if media_stat.st_size == size and int(media_stat.st_mtime) == mtime:
+            return wav_path
+        return None
+
     def _build_analysis_result(
         self,
         payload: dict,
@@ -118,7 +141,6 @@ class AnalyzerPipeline:
         media_path: Path,
         cache_dir: Path,
         wav_path: Path,
-        speech_wav_path: Path,
     ) -> AnalysisResult:
         sample_rate = int(payload.get("sample_rate", 16000))
         duration = float(payload.get("duration", 0))
@@ -162,7 +184,7 @@ class AnalyzerPipeline:
             media_path=media_path,
             cache_dir=cache_dir,
             wav_path=wav_path,
-            speech_wav_path=speech_wav_path,
+            speech_wav_path=wav_path,
             sample_rate=sample_rate,
             duration=duration,
             envelope=envelope,
@@ -172,46 +194,6 @@ class AnalyzerPipeline:
             mask_suggestions=mask_suggestions,
             speech_time_map=[],
         )
-
-    def _render_speech_only_audio(self, analysis: AnalysisResult, output_path: Path) -> List[tuple[float, float, float, float]]:
-        with wave.open(str(analysis.wav_path), "rb") as reader:
-            channels = reader.getnchannels()
-            if channels != 1:
-                raise RuntimeError("僅支援單聲道音訊。")
-            sample_width = reader.getsampwidth()
-            if sample_width != 2:
-                raise RuntimeError("音訊格式錯誤，需為 16bit PCM。")
-            audio_data = reader.readframes(reader.getnframes())
-
-        samples = np.frombuffer(audio_data, dtype=np.int16).copy()
-        total = len(samples)
-        segments = analysis.speech_segments
-        chunks: List[np.ndarray] = []
-        mapping: List[tuple[float, float, float, float]] = []
-        trimmed_cursor = 0.0
-
-        for seg in segments:
-            start = max(0, int(seg.start * analysis.sample_rate))
-            end = min(total, int(seg.end * analysis.sample_rate))
-            if end > start:
-                chunks.append(samples[start:end])
-                chunk_duration = (end - start) / float(analysis.sample_rate)
-                mapping.append((seg.start, seg.end, trimmed_cursor, trimmed_cursor + chunk_duration))
-                trimmed_cursor += chunk_duration
-
-        if not chunks:
-            chunks.append(samples)
-            full_duration = total / float(analysis.sample_rate)
-            mapping.append((0.0, full_duration, 0.0, full_duration))
-
-        merged = np.concatenate(chunks)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        with wave.open(str(output_path), "wb") as writer:
-            writer.setnchannels(1)
-            writer.setsampwidth(2)
-            writer.setframerate(analysis.sample_rate)
-            writer.writeframes(merged.astype(np.int16).tobytes())
-        return mapping
 
     def _merge_segments(self, segments: List[Segment]) -> List[Segment]:
         if not segments:

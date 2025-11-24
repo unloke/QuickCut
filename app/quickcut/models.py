@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, List, Optional, Sequence, Set
@@ -22,6 +24,7 @@ class QuickEditSettings:
     hop_ms: float = 10.0
     remove_fillers: bool = True
     remove_repeated: bool = True
+    add_audio_crossfades: bool = False
 
     def pre_roll_seconds(self) -> float:
         return self.pre_roll_ms / 1000.0
@@ -121,6 +124,7 @@ class WordTiming:
     word: str
     start: float
     end: float
+    confidence: float = 1.0
     normalized: str = ""
     label: str = "normal"
 
@@ -181,16 +185,14 @@ class TranscriptSegment:
                     word=word.word,
                     start=max(word.start, start),
                     end=min(word.end, end),
+                    confidence=word.confidence,
                     normalized=word.normalized,
                     label=word.label,
                 )
             )
 
         word_text = render_text_from_words(sliced_words)
-        if word_text:
-            text = word_text
-        else:
-            text = "".join(ch.char for ch in sliced_chars).strip()
+        text = word_text
 
         sliced_ranges: List[Segment] = []
         for rng in self.suppressed_ranges:
@@ -231,3 +233,31 @@ class ProjectState:
     analysis: AnalysisResult
     transcription: Optional[TranscriptionResult] = None
     regions: List[ClipRegion] = field(default_factory=list)
+    settings: QuickEditSettings = field(default_factory=QuickEditSettings)
+
+    def save_project(self, json_path: str):
+        def serialize_region(r: ClipRegion) -> dict:
+            d = dataclasses.asdict(r)
+            d['tags'] = list(d['tags'])
+            d['auto_hide_reasons'] = list(d['auto_hide_reasons'])
+            return d
+        data = {
+            "regions": [serialize_region(r) for r in self.regions],
+            "settings": dataclasses.asdict(self.settings),
+            "media_path": str(self.analysis.media_path),
+        }
+        with open(json_path, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+
+    @classmethod
+    def load_project(cls, json_path: str) -> tuple[List[ClipRegion], QuickEditSettings, Path]:
+        with open(json_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        regions = []
+        for r in data['regions']:
+            r['tags'] = set(r['tags'])
+            r['auto_hide_reasons'] = set(r['auto_hide_reasons'])
+            regions.append(ClipRegion(**r))
+        settings = QuickEditSettings(**data['settings'])
+        media_path = Path(data['media_path'])
+        return regions, settings, media_path

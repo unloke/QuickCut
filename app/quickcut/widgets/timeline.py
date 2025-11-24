@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+from bisect import bisect_left, bisect_right
 from typing import Iterable, List, Optional
 
 from PyQt5.QtCore import QPointF, QRectF, Qt, pyqtSignal as Signal
-from PyQt5.QtGui import QColor, QMouseEvent, QPainter, QPainterPath, QPen
+from PyQt5.QtGui import QColor, QMouseEvent, QPainter, QPainterPath, QPen, QPixmap
 from PyQt5.QtWidgets import QWidget
 
 from ..models import ClipRegion
@@ -23,19 +24,24 @@ class TimelineWidget(QWidget):
         self._hover_region: Optional[str] = None
         self._selected_region: Optional[str] = None
         self._envelope: List[tuple[float, float]] = []
+        self._envelope_keys: List[float] = []
         self._view_start = 0.0
         self._view_duration = 0.0
+        self._region_starts: List[float] = []
+        self._cache_pixmap: Optional[QPixmap] = None
+        self._cache_dirty = True
         self.setMouseTracking(True)
         self.setMinimumHeight(180)
 
     def set_regions(self, regions: Iterable[ClipRegion], duration: float, preserve_view: bool = False):
         old_view_start = self._view_start
         old_view_duration = self._view_duration
-        self._regions = list(regions)
+        self._regions = sorted(list(regions), key=lambda r: r.start)
         # 確保預留片段始終 visible
         for region in self._regions:
             if "placeholder" in region.tags:
                 region.visible = True
+        self._region_starts = [region.start for region in self._regions]
         self._duration = duration
         self._hover_region = None
         self._selected_region = None
@@ -45,11 +51,14 @@ class TimelineWidget(QWidget):
             self._view_start = max(0.0, min(old_view_start, max_start))
         else:
             self._reset_view_window()
+        self._invalidate_cache()
         self.update()
         self._emit_view_changed()
 
     def set_envelope(self, envelope: List[tuple[float, float]]):
-        self._envelope = envelope
+        self._envelope = sorted(envelope or [], key=lambda item: item[0])
+        self._envelope_keys = [time for time, _ in self._envelope]
+        self._invalidate_cache()
         self.update()
 
     def set_playhead(self, seconds: float):
@@ -73,6 +82,7 @@ class TimelineWidget(QWidget):
         if region_id == self._selected_region:
             return
         self._selected_region = region_id
+        self._invalidate_cache()
         self.update()
 
     def focus_view_on_region(self, region_id: str):
@@ -83,33 +93,51 @@ class TimelineWidget(QWidget):
 
     def paintEvent(self, event):
         painter = QPainter(self)
-        painter.fillRect(self.rect(), QColor("#101010"))
-        painter.setRenderHint(QPainter.Antialiasing, True)
+        if (
+            self._cache_dirty
+            or self._cache_pixmap is None
+            or self._cache_pixmap.size() != self.size()
+        ):
+            self._cache_pixmap = QPixmap(self.size())
+            self._cache_pixmap.fill(QColor("#101010"))
+            cache_painter = QPainter(self._cache_pixmap)
+            cache_painter.setRenderHint(QPainter.Antialiasing, True)
+            track_rect = self._track_rect()
+            self._draw_grid(cache_painter, track_rect)
+            self._draw_envelope(cache_painter, track_rect)
+            self._draw_regions(cache_painter, track_rect)
+            cache_painter.end()
+            self._cache_dirty = False
 
+        painter.drawPixmap(0, 0, self._cache_pixmap)
         track_rect = self._track_rect()
-        painter.setPen(QColor("#303033"))
-        for i in range(11):
-            x = track_rect.left() + (track_rect.width() * i / 10.0)
-            painter.drawLine(int(x), track_rect.top(), int(x), track_rect.bottom())
-
-        self._draw_envelope(painter, track_rect)
-        self._draw_regions(painter, track_rect)
         self._draw_playhead(painter, track_rect)
 
     def _draw_envelope(self, painter: QPainter, rect):
         if not self._envelope or self._duration <= 0:
             return
-        max_value = max((value for _, value in self._envelope), default=1e-6)
-        if max_value <= 0:
+        if not self._envelope_keys:
             return
         painter.save()
         view_start = self._view_start
         view_end = self._view_start + max(self._view_duration, 1e-6)
         time_span = max(self._view_duration, 1e-6)
+
+        start_idx = bisect_left(self._envelope_keys, view_start)
+        end_idx = bisect_right(self._envelope_keys, view_end)
+        view_data = self._envelope[start_idx:end_idx]
+
+        max_value = max((value for _, value in view_data), default=0.0)
+        if max_value <= 0 or len(view_data) < 2:
+            painter.restore()
+            return
+
+        pixel_width = max(1, int(rect.width()))
+        step = max(1, int(len(view_data) / (pixel_width * 2)))
+
         samples: list[QPointF] = []
-        for time, value in self._envelope:
-            if time < view_start or time > view_end:
-                continue
+        for i in range(0, len(view_data), step):
+            time, value = view_data[i]
             local_ratio = (time - view_start) / time_span
             x = rect.left() + local_ratio * rect.width()
             gain = min(1.0, value / max_value)
@@ -137,6 +165,12 @@ class TimelineWidget(QWidget):
         painter.setPen(pen)
         painter.drawPath(line_path)
         painter.restore()
+
+    def _draw_grid(self, painter: QPainter, track_rect: QRectF) -> None:
+        painter.setPen(QColor("#303033"))
+        for i in range(11):
+            x = track_rect.left() + (track_rect.width() * i / 10.0)
+            painter.drawLine(int(x), track_rect.top(), int(x), track_rect.bottom())
 
     def _draw_regions(self, painter: QPainter, rect):
         if self._duration <= 0:
@@ -230,6 +264,7 @@ class TimelineWidget(QWidget):
         region_id = region.region_id if region else None
         if region_id != self._hover_region:
             self._hover_region = region_id
+            self._invalidate_cache()
             self.update()
         super().mouseMoveEvent(event)
 
@@ -242,6 +277,7 @@ class TimelineWidget(QWidget):
         if new_selection != self._selected_region:
             self._selected_region = new_selection
             self.regionSelected.emit(new_selection)
+            self._invalidate_cache()
             self.update()
         elif region is None:
             self.regionSelected.emit(None)
@@ -276,14 +312,19 @@ class TimelineWidget(QWidget):
         if self._duration <= 0:
             return 0.0
         rect = self._track_rect()
-        ratio = max(0.0, min(1.0, (x - rect.left()) / max(1.0, rect.width())))
+        width = max(1.0, float(rect.width()))
+        ratio = max(0.0, min(1.0, (float(x) - float(rect.left())) / width))
         span = max(self._view_duration, 1e-6)
         return self._view_start + ratio * span
 
     def _find_region(self, time_point: float) -> Optional[ClipRegion]:
-        for region in self._regions:
-            if region.start <= time_point <= region.end:
-                return region
+        if not self._regions or not self._region_starts:
+            return None
+        idx = bisect_right(self._region_starts, time_point) - 1
+        if idx >= 0:
+            candidate = self._regions[idx]
+            if candidate.start <= time_point <= candidate.end:
+                return candidate
         return None
 
     def _track_rect(self) -> QRectF:
@@ -296,6 +337,7 @@ class TimelineWidget(QWidget):
         else:
             self._view_start = 0.0
             self._view_duration = max(self._duration, 1e-3)
+        self._invalidate_cache()
         self._emit_view_changed()
 
     def _ensure_playhead_visible(self) -> bool:
@@ -313,6 +355,7 @@ class TimelineWidget(QWidget):
                 self._view_start = new_start
                 changed = True
         if changed:
+            self._invalidate_cache()
             self._emit_view_changed()
         return changed
 
@@ -320,7 +363,8 @@ class TimelineWidget(QWidget):
         if angle_delta == 0 or self._duration <= 0:
             return
         factor = 0.9 if angle_delta > 0 else 1.1
-        min_span = min(self._duration, max(0.25, self._duration / 200.0))
+        # Allow deep zoom so that a single pixel can represent <10ms even on long clips.
+        min_span = min(self._duration, max(0.02, min(2.0, self._duration * 0.01)))
         new_span = max(min_span, min(self._duration, self._view_duration * factor if self._view_duration else self._duration * factor))
         anchor_time = self._x_to_time(anchor_x)
         if self._view_duration <= 0:
@@ -330,6 +374,7 @@ class TimelineWidget(QWidget):
         max_start = max(0.0, self._duration - new_span)
         self._view_start = max(0.0, min(new_start, max_start))
         self._view_duration = new_span
+        self._invalidate_cache()
         self._emit_view_changed()
         self.update()
 
@@ -342,6 +387,7 @@ class TimelineWidget(QWidget):
         new_start = max(0.0, min(self._view_start + delta_time, max_start))
         if new_start != self._view_start:
             self._view_start = new_start
+            self._invalidate_cache()
             self._emit_view_changed()
         self.update()
 
@@ -352,6 +398,7 @@ class TimelineWidget(QWidget):
         end = min(self._duration, max(start + 1e-3, end))
         self._view_start = start
         self._view_duration = end - start
+        self._invalidate_cache()
         self._emit_view_changed()
         self.update()
 
@@ -360,10 +407,17 @@ class TimelineWidget(QWidget):
             return
         ratio = max(0.0, min(1.0, ratio))
         max_start = self._duration - self._view_duration
-        new_start = ratio * max_start
-        if abs(new_start - self._view_start) < 1e-6:
+        self.set_view_start_time(ratio * max_start)
+
+    def set_view_start_time(self, start: float):
+        if self._duration <= 0 or self._view_duration <= 0 or self._view_duration >= self._duration:
             return
-        self._view_start = new_start
+        max_start = self._duration - self._view_duration
+        clamped = max(0.0, min(start, max_start))
+        if abs(clamped - self._view_start) < 1e-6:
+            return
+        self._view_start = clamped
+        self._invalidate_cache()
         self.update()
         self._emit_view_changed()
 
@@ -374,3 +428,6 @@ class TimelineWidget(QWidget):
         span = min(self._view_duration or self._duration, self._duration)
         start = min(max(self._view_start, 0.0), max(0.0, self._duration - span))
         self.viewChanged.emit(start, span, self._duration)
+
+    def _invalidate_cache(self):
+        self._cache_dirty = True

@@ -68,6 +68,9 @@ class QuickEditPanel(QFrame):
         self.remove_repeats = QCheckBox("遮罩重複語意")
         self.remove_repeats.setChecked(True)
 
+        self.add_audio_crossfades = QCheckBox("導出時包含音訊淡入淡出")
+        self.add_audio_crossfades.setChecked(False)
+
         for label, widget in [
             ("語音前預留", self.pre_roll),
             ("語音後預留", self.post_roll),
@@ -83,6 +86,7 @@ class QuickEditPanel(QFrame):
         layout.addLayout(grid)
         layout.addWidget(self.remove_fillers)
         layout.addWidget(self.remove_repeats)
+        layout.addWidget(self.add_audio_crossfades)
 
         self.analyze_button = QPushButton("分析")
         self.export_button = QPushButton("輸出結果")
@@ -101,6 +105,7 @@ class QuickEditPanel(QFrame):
             widget.valueChanged.connect(self._emit_settings)
         self.remove_fillers.stateChanged.connect(self._emit_settings)
         self.remove_repeats.stateChanged.connect(self._emit_settings)
+        self.add_audio_crossfades.stateChanged.connect(self._emit_settings)
         self.analyze_button.clicked.connect(self._handle_analyze_clicked)
         self.export_button.clicked.connect(self.exportRequested.emit)
 
@@ -116,6 +121,7 @@ class QuickEditPanel(QFrame):
             min_speech=self.min_speech.value(),
             remove_fillers=self.remove_fillers.isChecked(),
             remove_repeated=self.remove_repeats.isChecked(),
+            add_audio_crossfades=self.add_audio_crossfades.isChecked(),
         )
 
     def _emit_settings(self):

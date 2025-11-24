@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-import re
-import string
 import threading
-from bisect import bisect_left
-from dataclasses import dataclass, field
+import wave
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, List, Sequence, Set
+from typing import Dict, Iterable, List, Sequence
+
+import json
+from vosk import KaldiRecognizer, Model
 
 from .models import (
     CharacterTiming,
@@ -17,50 +18,39 @@ from .models import (
     render_text_from_words,
 )
 
-LABEL_PRIORITY = {"normal": 0, "repeat": 1, "stutter": 2, "filler": 3}
-FILLER_MERGE_GAP = 0.08
-DETECTION_MIN_DURATION = 0.02
-AUTO_HIDE_MIN_DURATION = 0.08
-AUTO_HIDE_MAX_DURATION = 0.5
-PADDING_BEFORE = 0.04
-PADDING_AFTER = 0.05
-STUTTER_MAX_GAP = 0.35
-MAX_BAD_RUN = 3
-BAD_RATIO_THRESHOLD = 0.85
-LOW_ENERGY_MIN_OVERLAP_RATIO = 0.8
-HIGH_ENERGY_VETO_RATIO = 0.25
-CONFIDENCE_THRESHOLD = 0.4
-PUNCTUATION_CHARS = string.punctuation + "，。！？；：「」『』（）《》〈〉、……—～·【】『』"
+# 擴充贅字庫 (中英混合)
+SAFE_FILLERS = {
+    "um", "uh", "erm", "hmm", "uhh", "er", "ah",
+    "呃", "嗯", "啊"}
+AMBIGUOUS_FILLERS = {"like", "actually", "basically", "literally", "sorta", "kinda", "right", "you know"}
 
-EN_FILLER_SINGLE = {
-    "um",
-    "uh",
-    "erm",
-    "hmm",
-    "like",
-    "actually",
-    "basically",
-    "literally",
-    "kind",
-    "sort",
-}
-ZH_FILLER_SINGLE = {"欸", "嗯", "呃", "啊", "啦", "然後", "那個", "這個", "其實", "就是說", "這樣子", "基本上"}
-FILLER_MULTI_TOKENS = [
-    ("you", "know"),
-    ("i", "mean"),
-    ("you", "see"),
-    ("sort", "of"),
-    ("kind", "of"),
-    ("in", "fact"),
-    ("你", "知道"),
-    ("那個",),
-    ("這個",),
-    ("然後",),
-    ("其實",),
-    ("就是說",),
-    ("基本上",),
-    ("這樣子",),
-]
+PUNCTUATION = set(" !\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~。，、！？：；「」『』（）—…")
+VOWELS = set("aeiou")
+STANDARD_ABBREVIATIONS = {"tv", "fm", "am", "ok"}
+STUTTER_MAX_GAP = 0.35
+PHRASE_REPEAT_MAX = 4
+PHRASE_REPEAT_THRESHOLD = 0.82
+INTERVAL_GAP = 0.25
+SEGMENT_GAP = 1.0
+
+# SenseVoice 建議的最小處理單元
+
+def _is_junk_token(word: str, confidence: float) -> bool:
+    text = (word or "").strip().lower()
+    if not text:
+        return True
+    if confidence < 0.4:
+        return True
+    if len(text) == 1 and text not in {"a", "i"}:
+        return True
+    if len(text) < 3:
+        if text in STANDARD_ABBREVIATIONS:
+            return False
+        if all(ch.isalpha() and ch not in VOWELS for ch in text):
+            return True
+    if not any(ch.isalpha() for ch in text):
+        return True
+    return False
 
 
 @dataclass
@@ -68,16 +58,13 @@ class WordToken:
     text: str
     start: float
     end: float
-    normalized: str
+    confidence: float
     label: str = "normal"
-    confidence: float = 1.0
 
-    def duration(self) -> float:
-        return max(0.0, self.end - self.start)
-
-    def set_label(self, new_label: str) -> None:
-        if LABEL_PRIORITY[new_label] > LABEL_PRIORITY[self.label]:
-            self.label = new_label
+    @property
+    def normalized(self) -> str:
+        # 移除標點進行比較
+        return "".join(ch for ch in self.text.lower().strip() if ch not in PUNCTUATION)
 
 
 @dataclass
@@ -85,372 +72,369 @@ class SuppressedInterval:
     start: float
     end: float
     label: str
-    content: str
-    token_indices: List[int] = field(default_factory=list)
-    label_counts: Dict[str, int] = field(default_factory=dict)
-    detection_reasons: Set[str] = field(default_factory=set)
-    decision_reasons: Set[str] = field(default_factory=set)
-    auto_hide: bool = False
-    token_count: int = 0
-    bad_token_count: int = 0
-    bad_ratio: float = 0.0
-    energy_overlap: float = 0.0
-    avg_confidence: float = 0.0
-    core_start: float = 0.0
-    core_end: float = 0.0
-    longest_bad_run: int = 0
-    loud_ratio: float = 0.0
+    tokens: List[int]
 
 
-def _normalize_text(text: str) -> str:
-    if not text:
-        return ""
-    normalized = text.strip()
-    if not normalized:
-        return ""
-    normalized = normalized.strip(PUNCTUATION_CHARS).strip()
-    normalized = re.sub(r"\s+", " ", normalized)
-    return normalized.lower()
+@dataclass
+class MergedChunk:
+    start: float
+    end: float
+    segments: List[Segment]
+    index: int
 
 
-def _build_word_stream(segments: List[dict]) -> tuple[List[WordToken], List[tuple[int, int]]]:
+class VoskTranscriber:
+    """Performs verbatim ASR with Vosk and marks fillers / repeated phrases."""
+
+    def __init__(self, model_dir: Path):
+        self.model_dir = Path(model_dir)
+        if not self.model_dir.exists():
+            raise FileNotFoundError(f"找不到 Vosk 模型：{self.model_dir}")
+        self._model: Model | None = None
+        self._lock = threading.Lock()
+
+    def _ensure_model(self) -> Model:
+        if self._model is None:
+            self._model = Model(str(self.model_dir))
+        return self._model
+
+    def transcribe(
+        self,
+        wav_path: Path,
+        speech_segments: List[Segment],
+    ) -> TranscriptionResult:
+        wav_path = Path(wav_path)
+        if not speech_segments:
+            return TranscriptionResult(segments=[], full_text="")
+
+        words = self._run_vosk(wav_path, speech_segments)
+        if not words:
+            raise RuntimeError("轉錄失敗：未取得任何語音辨識結果，請確認音訊內容與格式。")
+        words.sort(key=lambda item: float(item.get("start", 0.0)))
+        ordered_segments = sorted(speech_segments, key=lambda seg: seg.start)
+
+        transcripts: List[TranscriptSegment] = []
+        for segment in ordered_segments:
+            words_for_segment = _slice_words_for_segment(
+                words,
+                segment.start,
+                segment.end,
+            )
+
+            segment_data = _build_segment_from_words(segment, words_for_segment)
+            tokens, spans = _build_word_stream([segment_data])
+
+            if not tokens:
+                transcripts.append(
+                    TranscriptSegment(
+                        start=segment.start,
+                        end=segment.end,
+                        text="",
+                        characters=[],
+                        words=[],
+                        suppressed_ranges=[],
+                    )
+                )
+                continue
+
+            _label_fillers(tokens)
+            _label_repetitions(tokens)
+
+            intervals = _collect_intervals(tokens)
+            mapped_words = _tokens_to_word_timings(tokens)
+            mapped_intervals = _intervals_to_segments(intervals)
+
+            if spans:
+                start_idx, end_idx = spans[0]
+                word_slice = mapped_words[start_idx:end_idx]
+            else:
+                word_slice = []
+
+            # 智慧渲染：SenseVoice 對中英文的處理
+            display_text = _smart_render_text(word_slice)
+
+            characters = _build_character_map(display_text, segment.start, segment.end)
+            suppressed = _slice_intervals(mapped_intervals, segment.start, segment.end)
+
+            transcripts.append(
+                TranscriptSegment(
+                    start=segment.start,
+                    end=segment.end,
+                    text=display_text,
+                    is_filler=any(rng.kind == "filler" for rng in suppressed),
+                    is_repeat=any(rng.kind == "repeat" for rng in suppressed),
+                    characters=characters,
+                    words=word_slice,
+                    suppressed_ranges=suppressed,
+                )
+            )
+
+        full_text = " ".join(seg.text for seg in transcripts if seg.text).strip()
+        return TranscriptionResult(segments=transcripts, full_text=full_text)
+
+    def _run_vosk(self, wav_path: Path, speech_segments: Sequence[Segment]) -> List[Dict[str, float | str]]:
+        model = self._ensure_model()
+        if not wav_path.exists():
+            raise FileNotFoundError(f"音訊檔不存在：{wav_path}")
+
+        with self._lock, wave.open(str(wav_path), "rb") as reader:
+            channels = reader.getnchannels()
+            sample_rate = reader.getframerate()
+            sample_width = reader.getsampwidth()
+            if channels != 1:
+                raise RuntimeError("Vosk 僅支援單聲道 16kHz 音訊。")
+            if sample_rate != 16000:
+                raise RuntimeError(f"音訊取樣率需為 16kHz，目前為 {sample_rate}Hz。")
+            if sample_width != 2:
+                raise RuntimeError("音訊必須為 16-bit PCM 格式。")
+
+            duration = reader.getnframes() / float(sample_rate or 1)
+            chunks = _prepare_recognition_windows(speech_segments, duration)
+            if not chunks:
+                chunks = [MergedChunk(start=0.0, end=duration, segments=[], index=0)]
+
+            bytes_per_frame = sample_width * channels
+            words: List[Dict[str, float | str]] = []
+            for chunk in chunks:
+                start_frame = max(0, int(round(chunk.start * sample_rate)))
+                end_frame = max(start_frame, int(round(chunk.end * sample_rate)))
+                if end_frame <= start_frame:
+                    continue
+                reader.setpos(start_frame)
+
+                rec = KaldiRecognizer(model, sample_rate)
+                rec.SetWords(True)
+
+                remaining_frames = end_frame - start_frame
+                while remaining_frames > 0:
+                    frame_batch = min(remaining_frames, 4000)
+                    data = reader.readframes(frame_batch)
+                    if not data:
+                        break
+                    frames_read = len(data) // bytes_per_frame
+                    if frames_read <= 0:
+                        break
+                    remaining_frames -= frames_read
+                    if rec.AcceptWaveform(data):
+                        chunk_result = json.loads(rec.Result() or "{}")
+                        words.extend(_extract_words_from_result(chunk_result, offset_seconds=start_frame / sample_rate))
+
+                final_result = json.loads(rec.FinalResult() or "{}")
+                words.extend(_extract_words_from_result(final_result, offset_seconds=start_frame / sample_rate))
+        return words
+
+
+
+def _merge_close_segments(segments: Sequence[Segment], gap_threshold: float = 1.0) -> List[MergedChunk]:
+    if not segments:
+        return []
+    ordered = sorted(segments, key=lambda seg: seg.start)
+    groups: List[List[Segment]] = []
+    current: List[Segment] = [ordered[0]]
+
+    for seg in ordered[1:]:
+        prev = current[-1]
+        gap = seg.start - prev.end
+        if gap < gap_threshold:
+            current.append(seg)
+        else:
+            groups.append(current)
+            current = [seg]
+    groups.append(current)
+
+    merged: List[MergedChunk] = []
+    for idx, group in enumerate(groups):
+        start = group[0].start
+        end = max(seg.end for seg in group)
+        merged.append(MergedChunk(start=start, end=end, segments=list(group), index=idx))
+    return merged
+
+
+def _prepare_recognition_windows(segments: Sequence[Segment], duration: float) -> List[MergedChunk]:
+    """Clamp segments to the audio duration and merge gaps to reduce Vosk passes."""
+    if not segments or duration <= 0:
+        return []
+    valid: List[Segment] = []
+    for seg in segments:
+        start = max(0.0, min(float(seg.start), duration))
+        end = max(0.0, min(float(seg.end), duration))
+        if end - start <= 1e-3:
+            continue
+        valid.append(Segment(start=start, end=end, kind=seg.kind, label=seg.label, meta=dict(seg.meta or {})))
+    if not valid:
+        return []
+    return _merge_close_segments(valid, gap_threshold=SEGMENT_GAP)
+
+
+def _extract_words_from_result(payload: dict, offset_seconds: float = 0.0) -> List[Dict[str, float | str]]:
+    words: List[Dict[str, float | str]] = []
+    for word in payload.get("result", []) or []:
+        start = offset_seconds + float(word.get("start", 0.0))
+        end = offset_seconds + float(word.get("end", word.get("start", 0.0)))
+        confidence = float(word.get("confidence", word.get("conf", word.get("probability", 1.0))))
+        words.append(
+            {
+                "word": word.get("word", ""),
+                "start": start,
+                "end": end,
+                "confidence": confidence,
+            }
+        )
+    return words
+
+
+def _slice_words_for_segment(
+    words: Sequence[Dict[str, float | str]],
+    start: float,
+    end: float,
+    tolerance: float = 0.15,
+) -> List[Dict[str, float | str]]:
+    sliced: List[Dict[str, float | str]] = []
+    for word in words:
+        w_start = float(word.get("start", 0.0))
+        w_end = float(word.get("end", w_start))
+        if w_end < start - tolerance or w_start > end + tolerance:
+            continue
+        sliced.append(
+            {
+                "word": word.get("word", ""),
+                "start": max(start, w_start),
+                "end": min(end, w_end),
+                "confidence": float(word.get("confidence", 1.0)),
+            }
+        )
+    return sliced
+
+
+def _build_segment_from_words(segment: Segment, words: List[Dict[str, float | str]]) -> dict:
+    text = "".join(str(word.get("word", "")) for word in words).strip()
+    return {
+        "text": text,
+        "start": float(segment.start),
+        "end": float(segment.end),
+        "words": [
+            {
+                "word": str(word.get("word", "")),
+                "start": float(word.get("start", 0.0)),
+                "end": float(word.get("end", word.get("start", 0.0))),
+                "confidence": float(word.get("confidence", 1.0)),
+            }
+            for word in words
+        ],
+    }
+
+
+def _tokens_to_word_timings(tokens: Sequence[WordToken]) -> List[WordTiming]:
+    mapped: List[WordTiming] = []
+    for token in tokens:
+        mapped.append(
+            WordTiming(
+                word=token.text,
+                start=float(token.start),
+                end=float(token.end),
+                confidence=token.confidence,
+                normalized=token.normalized,
+                label=token.label,
+            )
+        )
+    return mapped
+
+
+def _intervals_to_segments(intervals: Sequence[SuppressedInterval]) -> List[Segment]:
+    mapped: List[Segment] = []
+    for interval in intervals:
+        mapped.append(
+            Segment(
+                start=float(interval.start),
+                end=float(interval.end),
+                kind=interval.label,
+                label=interval.label,
+            )
+        )
+    return mapped
+
+
+def _build_word_stream(segments: Iterable[dict]) -> tuple[List[WordToken], List[tuple[int, int]]]:
     tokens: List[WordToken] = []
     spans: List[tuple[int, int]] = []
-    for entry in segments:
-        seg_start_idx = len(tokens)
-        words = entry.get("words") or []
-        if not words:
-            token = _build_token(entry.get("text", ""), entry.get("start"), entry.get("end"), None)
-            if token:
-                tokens.append(token)
-        else:
-            for word in words:
-                token = _build_token(word.get("word"), word.get("start"), word.get("end"), word.get("probability"))
-                if token:
-                    tokens.append(token)
-        spans.append((seg_start_idx, len(tokens)))
+    for segment in segments:
+        start_idx = len(tokens)
+        for word in segment.get("words", []) or []:
+            w_text = str(word.get("word", ""))
+            confidence = float(word.get("confidence", 1.0))
+            if _is_junk_token(w_text, confidence):
+                continue
+            tokens.append(
+                WordToken(
+                    text=w_text,
+                    start=float(word.get("start", 0.0)),
+                    end=float(word.get("end", word.get("start", 0.0))),
+                    confidence=confidence,
+                )
+            )
+        spans.append((start_idx, len(tokens)))
     return tokens, spans
 
 
-def _build_token(
-    word: str | None,
-    start: float | None,
-    end: float | None,
-    confidence: float | None,
-) -> WordToken | None:
-    raw_text = word or ""
-    trimmed = raw_text.strip()
-    if not trimmed:
-        return None
-    start = float(start or 0.0)
-    end = float(end or start)
-    if end <= start:
-        end = start + 1e-3
-    conf = float(confidence) if confidence is not None else 1.0
-    if not (0.0 <= conf <= 1.0):
-        conf = 1.0
-    return WordToken(text=raw_text, start=start, end=end, normalized=_normalize_text(raw_text), confidence=conf)
-
-
-def _estimate_speech_duration(
-    segments: List[dict],
-    tokens: Sequence[WordToken],
-    time_map: List[tuple[float, float, float, float]] | None,
-) -> float:
-    if time_map:
-        return max((cut_end for *_, cut_end in time_map), default=0.0)
-    if tokens:
-        return max(token.end for token in tokens)
-    return max((float(entry.get("end", 0.0)) for entry in segments), default=0.0)
-
-
-def _label_single_word_fillers(tokens: Sequence[WordToken]) -> None:
+def _label_fillers(tokens: Sequence[WordToken]) -> None:
     for token in tokens:
-        norm = token.normalized
-        if not norm:
-            continue
-        if norm in EN_FILLER_SINGLE or norm in ZH_FILLER_SINGLE:
-            token.set_label("filler")
+        if token.normalized in SAFE_FILLERS:
+            token.label = "filler"
 
 
-def _label_multi_word_fillers(tokens: Sequence[WordToken]) -> None:
-    if not tokens:
-        return
-    patterns = [_normalize_pattern(pattern) for pattern in FILLER_MULTI_TOKENS]
-    if not patterns:
-        return
-    max_len = max(len(pattern) for pattern in patterns)
-    lookup = {pattern: pattern for pattern in patterns}
+def _label_repetitions(tokens: Sequence[WordToken]) -> None:
+    for idx in range(1, len(tokens)):
+        prev = tokens[idx - 1]
+        curr = tokens[idx]
+        if curr.normalized and prev.normalized:
+            if curr.normalized == prev.normalized and curr.start - prev.end <= STUTTER_MAX_GAP:
+                curr.label = "repeat"
+
     for idx in range(len(tokens)):
-        for length in range(max_len, 1, -1):
-            if idx + length > len(tokens):
+        for span in range(2, PHRASE_REPEAT_MAX + 1):
+            if idx + 2 * span > len(tokens):
                 continue
-            window = tuple(token.normalized for token in tokens[idx : idx + length])
-            if window in lookup and all(window):
-                for token in tokens[idx : idx + length]:
-                    token.set_label("filler")
-                break
+            first = [tok.normalized for tok in tokens[idx : idx + span]]
+            second = [tok.normalized for tok in tokens[idx + span : idx + 2 * span]]
+            if not all(first) or not all(second):
+                continue
+            if first == second:
+                for tok in tokens[idx + span : idx + 2 * span]:
+                    tok.label = "repeat"
 
 
-def _normalize_pattern(pattern: tuple[str, ...]) -> tuple[str, ...]:
-    return tuple(part.strip().lower() for part in pattern if part.strip())
-
-
-def _label_stutters(tokens: Sequence[WordToken]) -> None:
-    for idx in range(len(tokens) - 1):
-        current = tokens[idx]
-        nxt = tokens[idx + 1]
-        if (
-            current.normalized
-            and current.normalized == nxt.normalized
-            and nxt.label == "normal"
-            and nxt.start - current.end <= STUTTER_MAX_GAP
-        ):
-            nxt.set_label("stutter")
-
-
-def _collect_hidden_intervals(tokens: Sequence[WordToken]) -> List[SuppressedInterval]:
+def _collect_intervals(tokens: Sequence[WordToken]) -> List[SuppressedInterval]:
     intervals: List[SuppressedInterval] = []
     idx = 0
-    total = len(tokens)
-    while idx < total:
+    while idx < len(tokens):
         token = tokens[idx]
-        if token.label == "filler":
-            start_idx = idx
-            end_idx = idx
-            content = token.text.strip()
-            current_end = token.end
-            while end_idx + 1 < total:
-                nxt = tokens[end_idx + 1]
-                if nxt.label == "filler" and nxt.start - current_end <= FILLER_MERGE_GAP:
-                    end_idx += 1
-                    current_end = max(current_end, nxt.end)
-                    if nxt.text.strip():
-                        content = f"{content} {nxt.text.strip()}".strip()
-                    continue
+        if token.label == "normal":
+            idx += 1
+            continue
+        start = token.start
+        end = token.end
+        label = token.label
+        indices = [idx]
+        j = idx + 1
+        while j < len(tokens):
+            nxt = tokens[j]
+            if nxt.label == label and nxt.start - end <= INTERVAL_GAP:
+                end = max(end, nxt.end)
+                indices.append(j)
+                j += 1
+            else:
                 break
-            indices = list(range(start_idx, end_idx + 1))
-            interval = SuppressedInterval(
-                start=tokens[start_idx].start,
-                end=max(tokens[end_idx].end, tokens[start_idx].end),
-                label="filler",
-                content=content or "filler",
-                token_indices=indices,
-                label_counts={"filler": len(indices)},
-                detection_reasons={"filler"},
-                core_start=tokens[start_idx].start,
-                core_end=max(tokens[end_idx].end, tokens[start_idx].end),
-                longest_bad_run=len(indices),
-            )
-            intervals.append(interval)
-            idx = end_idx + 1
-            continue
-        if token.label == "stutter":
-            prev_norm = tokens[idx - 1].normalized if idx > 0 else ""
-            if prev_norm and prev_norm == token.normalized:
-                interval = SuppressedInterval(
-                    start=token.start,
-                    end=token.end,
-                    label="stutter",
-                    content=token.text.strip() or token.normalized or "stutter",
-                    token_indices=[idx],
-                    label_counts={"stutter": 1},
-                    detection_reasons={"stutter"},
-                    core_start=token.start,
-                    core_end=token.end,
-                    longest_bad_run=1,
-                )
-                intervals.append(interval)
-        idx += 1
-
-    cleaned: List[SuppressedInterval] = []
-    for interval in intervals:
-        duration = interval.end - interval.start
-        if duration < DETECTION_MIN_DURATION:
-            continue
-        interval.bad_token_count = len(interval.token_indices)
-        if not interval.content:
-            interval.content = interval.label
-        cleaned.append(interval)
-    return cleaned
+        intervals.append(SuppressedInterval(start=start, end=end, label=label, tokens=indices))
+        idx = j
+    return intervals
 
 
-def _decide_auto_hide(
-    intervals: Sequence[SuppressedInterval],
-    tokens: Sequence[WordToken],
-    low_energy_spans: Sequence[tuple[float, float]],
-) -> None:
-    for interval in intervals:
-        interval.token_count = _count_tokens_in_span(tokens, interval.core_start, interval.core_end)
-        interval.bad_token_count = len(interval.token_indices)
-        if interval.bad_token_count:
-            conf_sum = sum(max(0.0, min(1.0, tokens[idx].confidence)) for idx in interval.token_indices)
-            interval.avg_confidence = conf_sum / interval.bad_token_count
-        else:
-            interval.avg_confidence = 0.0
-        interval.bad_ratio = (interval.bad_token_count / interval.token_count) if interval.token_count > 0 else 0.0
-        interval.energy_overlap = _overlap_ratio(interval.core_start, interval.core_end, low_energy_spans)
-        interval.auto_hide = _interval_passes_gates(interval)
-
-
-def _count_tokens_in_span(tokens: Sequence[WordToken], start: float, end: float) -> int:
-    total = 0
-    for token in tokens:
-        if token.end <= start:
-            continue
-        if token.start >= end:
-            break
-        total += 1
-    return total
-
-
-def _interval_passes_gates(interval: SuppressedInterval) -> bool:
-    duration = max(0.0, interval.core_end - interval.core_start)
-    ok = True
-    if duration < AUTO_HIDE_MIN_DURATION:
-        interval.decision_reasons.add("duration_short")
-        ok = False
-    if duration > AUTO_HIDE_MAX_DURATION:
-        interval.decision_reasons.add("duration_long")
-        ok = False
-    if interval.token_count == 0:
-        interval.decision_reasons.add("no_tokens")
-        ok = False
-    elif interval.bad_ratio < BAD_RATIO_THRESHOLD:
-        interval.decision_reasons.add("density_low")
-        ok = False
-    if interval.energy_overlap < LOW_ENERGY_MIN_OVERLAP_RATIO:
-        interval.decision_reasons.add("energy_high")
-        ok = False
-    if interval.longest_bad_run > MAX_BAD_RUN:
-        interval.decision_reasons.add("run_limit")
-        ok = False
-    if interval.avg_confidence < CONFIDENCE_THRESHOLD:
-        interval.decision_reasons.add("low_confidence")
-        ok = False
-    return ok
-
-
-def _apply_interval_padding(
-    intervals: Sequence[SuppressedInterval],
-    speech_duration: float,
-) -> List[SuppressedInterval]:
-    padded: List[SuppressedInterval] = []
-    for interval in intervals:
-        start = max(0.0, interval.core_start - PADDING_BEFORE)
-        end = interval.core_end + PADDING_AFTER
-        if speech_duration > 0:
-            end = min(speech_duration, end)
-        if end - start <= 1e-3:
-            continue
-        interval.start = start
-        interval.end = end
-        padded.append(interval)
-    return padded
-
-
-def _project_low_energy_segments(
-    low_segments: Sequence[Segment] | None,
-    time_map: List[tuple[float, float, float, float]] | None,
-) -> List[tuple[float, float]]:
-    if not low_segments:
-        return []
-    if not time_map:
-        spans = []
-        for seg in low_segments:
-            start = float(seg.start)
-            end = float(seg.end)
-            if end > start:
-                spans.append((start, end))
-        return spans
-
-    spans: List[tuple[float, float]] = []
-    for seg in low_segments:
-        low_start = float(seg.start)
-        low_end = float(seg.end)
-        if low_end <= low_start:
-            continue
-        for original_start, original_end, cut_start, cut_end in time_map:
-            if low_end <= original_start or low_start >= original_end:
-                continue
-            span_start = max(low_start, original_start)
-            span_end = min(low_end, original_end)
-            if span_end <= span_start:
-                continue
-            original_span = max(original_end - original_start, 1e-6)
-            cut_span = max(cut_end - cut_start, 1e-6)
-            scale = cut_span / original_span
-            cut_span_start = cut_start + (span_start - original_start) * scale
-            cut_span_end = cut_start + (span_end - original_start) * scale
-            if cut_span_end > cut_span_start:
-                spans.append((cut_span_start, cut_span_end))
-    spans.sort(key=lambda item: item[0])
-    return spans
-
-
-def _map_intervals_to_original(
-    intervals: Sequence[SuppressedInterval],
-    mapper: Callable[[float], float],
-) -> List[Segment]:
-    mapped: List[Segment] = []
-    for interval in intervals:
-        start = mapper(interval.start)
-        end = mapper(interval.end)
-        if end - start <= 1e-4:
-            continue
-        meta: Dict[str, object] = {
-            "auto_hide": interval.auto_hide,
-            "token_count": interval.token_count,
-            "bad_token_count": interval.bad_token_count,
-            "bad_ratio": interval.bad_ratio,
-            "energy_overlap": interval.energy_overlap,
-            "avg_confidence": interval.avg_confidence,
-            "core_start": interval.core_start,
-            "core_end": interval.core_end,
-            "label_counts": dict(interval.label_counts),
-            "longest_bad_run": interval.longest_bad_run,
-            "loud_ratio": interval.loud_ratio,
-        }
-        if interval.detection_reasons:
-            meta["detection_reasons"] = sorted(interval.detection_reasons)
-        if interval.decision_reasons:
-            meta["decision_reasons"] = sorted(interval.decision_reasons)
-        mapped.append(Segment(start=start, end=end, kind=interval.label, label=interval.content, meta=meta))
-    mapped.sort(key=lambda seg: seg.start)
-    return mapped
-
-
-def _overlap_ratio(start: float, end: float, spans: Sequence[tuple[float, float]]) -> float:
-    duration = max(end - start, 1e-6)
-    if not spans:
-        return 0.0
-    overlap = 0.0
-    for span_start, span_end in spans:
-        if span_end <= start:
-            continue
-        if span_start >= end:
-            break
-        overlap += max(0.0, min(end, span_end) - max(start, span_start))
-    return max(0.0, min(1.0, overlap / duration))
-
-
-def _map_words_to_original(tokens: Sequence[WordToken], mapper: Callable[[float], float]) -> List[WordTiming]:
-    mapped: List[WordTiming] = []
-    for token in tokens:
-        start = mapper(token.start)
-        end = mapper(token.end)
-        if end - start <= 1e-4:
-            end = start + 1e-4
-        mapped.append(WordTiming(word=token.text, start=start, end=end, normalized=token.normalized, label=token.label))
-    return mapped
-
-
-def _slice_intervals_for_segment(ranges: Sequence[Segment], start: float, end: float) -> List[Segment]:
+def _slice_intervals(ranges: Sequence[Segment], start: float, end: float) -> List[Segment]:
     sliced: List[Segment] = []
     for rng in ranges:
         overlap_start = max(start, rng.start)
         overlap_end = min(end, rng.end)
-        if overlap_end - overlap_start <= 1e-3:
+        if overlap_end - overlap_start <= 1e-4:
             continue
         sliced.append(
             Segment(
@@ -464,199 +448,46 @@ def _slice_intervals_for_segment(ranges: Sequence[Segment], start: float, end: f
     return sliced
 
 
-class TranscriptionEngine:
-    """Wraps the Whisper tiny model with lightweight caching."""
+def _smart_render_text(words: List[WordTiming]) -> str:
+    """Intelligently join words with spaces based on character type (CJK vs Latin)."""
+    if not words:
+        return ""
+    
+    parts = []
+    for i, w in enumerate(words):
+        text = w.word
+        # 如果是第一個詞，直接加入
+        if i == 0:
+            parts.append(text)
+            continue
+            
+        prev_text = words[i-1].word
+        
+        # 檢查當前詞和前一個詞是否包含 CJK 字符
+        is_curr_cjk = any('\u4e00' <= char <= '\u9fff' for char in text)
+        is_prev_cjk = any('\u4e00' <= char <= '\u9fff' for char in prev_text)
+        
+        # 如果兩個都是中文，不加空格；否則加空格
+        if is_curr_cjk and is_prev_cjk:
+            parts.append(text)
+        else:
+            parts.append(" " + text)
+            
+    return "".join(parts)
 
-    def __init__(self, model_size: str = "tiny"):
-        self.model_size = model_size
-        self._model = None
-        self._lock = threading.Lock()
 
-    def _ensure_model(self):
-        if self._model is None:
-            import whisper
-
-            self._model = whisper.load_model(self.model_size)
-
-    def transcribe(
-        self,
-        wav_path: Path,
-        time_map: List[tuple[float, float, float, float]] | None = None,
-        envelope: List[tuple[float, float]] | None = None,
-        low_energy_segments: Sequence[Segment] | None = None,
-        low_energy_threshold_db: float | None = None,
-    ) -> TranscriptionResult:
-        wav_path = Path(wav_path)
-        with self._lock:
-            self._ensure_model()
-            result = self._model.transcribe(
-                str(wav_path),
-                fp16=False,
-                verbose=False,
-                word_timestamps=True,
-            )
-
-        segments_data = sorted(result.get("segments", []), key=lambda seg: float(seg.get("start", 0.0)))
-        if not segments_data:
-            return TranscriptionResult(segments=[], full_text="")
-
-        word_stream, segment_word_spans = _build_word_stream(segments_data)
-        speech_duration = _estimate_speech_duration(segments_data, word_stream, time_map)
-        mapper = lambda value: self._map_to_original_time(value, time_map)
-        _label_single_word_fillers(word_stream)
-        _label_multi_word_fillers(word_stream)
-        _label_stutters(word_stream)
-        hidden_intervals = _collect_hidden_intervals(word_stream)
-        energy_spans = _project_low_energy_segments(low_energy_segments, time_map)
-        _decide_auto_hide(hidden_intervals, word_stream, energy_spans)
-        self._apply_envelope_veto(hidden_intervals, mapper, envelope, low_energy_threshold_db)
-        hidden_intervals = _apply_interval_padding(hidden_intervals, speech_duration)
-
-        mapped_words = _map_words_to_original(word_stream, mapper)
-        mapped_hidden = _map_intervals_to_original(hidden_intervals, mapper)
-
-        transcripts: List[TranscriptSegment] = []
-        for idx, entry in enumerate(segments_data):
-            local_start = float(entry.get("start", 0.0))
-            local_end = float(entry.get("end", local_start))
-            start = mapper(local_start)
-            end = mapper(local_end)
-            span_start, span_end = segment_word_spans[idx]
-            word_slice = mapped_words[span_start:span_end]
-            display_text = render_text_from_words(word_slice) or entry.get("text", "").strip()
-            characters = self._build_character_map(display_text, start, end, envelope, word_slice)
-            suppressed_ranges = _slice_intervals_for_segment(mapped_hidden, start, end)
-            transcripts.append(
-                TranscriptSegment(
-                    start=start,
-                    end=end,
-                    text=display_text,
-                    is_filler=any(rng.kind == "filler" for rng in suppressed_ranges),
-                    is_repeat=any(rng.kind in {"stutter", "repeat"} for rng in suppressed_ranges),
-                    characters=characters,
-                    words=word_slice,
-                    suppressed_ranges=suppressed_ranges,
-                )
-            )
-
-        full_text = " ".join(seg.text for seg in transcripts).strip()
-        return TranscriptionResult(segments=transcripts, full_text=full_text)
-
-    def _map_to_original_time(
-        self, local_time: float, time_map: List[tuple[float, float, float, float]] | None
-    ) -> float:
-        if not time_map:
-            return local_time
-        for original_start, original_end, cut_start, cut_end in time_map:
-            if cut_start <= local_time <= cut_end:
-                span = max(1e-6, cut_end - cut_start)
-                ratio = (local_time - cut_start) / span
-                return original_start + ratio * (original_end - original_start)
-        if local_time < time_map[0][2]:
-            return time_map[0][0]
-        return time_map[-1][1]
-
-    def _apply_envelope_veto(
-        self,
-        intervals: Sequence[SuppressedInterval],
-        mapper: Callable[[float], float],
-        envelope: Sequence[tuple[float, float]] | None,
-        threshold_db: float | None,
-    ) -> None:
-        if not intervals or not envelope or threshold_db is None:
-            return
-        envelope_points = list(envelope)
-        if not envelope_points:
-            return
-        envelope_times = [point[0] for point in envelope_points]
-        sample_threshold = 10 ** (float(threshold_db) / 20.0)
-        for interval in intervals:
-            original_start = mapper(interval.core_start)
-            original_end = mapper(interval.core_end)
-            if original_end - original_start <= 1e-4:
-                interval.loud_ratio = 0.0
-                continue
-            span = original_end - original_start
-            steps = max(3, min(25, int(span / 0.04)))
-            values: List[float] = []
-            for step in range(steps):
-                if steps == 1:
-                    point = (original_start + original_end) / 2.0
-                else:
-                    point = original_start + span * (step / (steps - 1))
-                values.append(self._sample_envelope(envelope_points, envelope_times, point))
-            if not values:
-                interval.loud_ratio = 0.0
-                continue
-            loud_ratio = sum(1 for value in values if value > sample_threshold) / len(values)
-            interval.loud_ratio = loud_ratio
-            if interval.auto_hide and loud_ratio > HIGH_ENERGY_VETO_RATIO:
-                interval.auto_hide = False
-                interval.decision_reasons.add("energy_veto")
-
-    def _build_character_map(
-        self,
-        text: str,
-        start: float,
-        end: float,
-        envelope: List[tuple[float, float]] | None,
-        word_timings: Sequence[WordTiming] | None,
-    ) -> List[CharacterTiming]:
-        cleaned = [ch for ch in text if not ch.isspace()]
-        if not cleaned or end <= start:
-            return []
-        total = len(cleaned)
-        step = (end - start) / total
-        envelope_points: Sequence[tuple[float, float]] = envelope or []
-        envelope_times = [point[0] for point in envelope_points]
-        timeline: List[CharacterTiming] = []
-        if word_timings:
-            for word in word_timings:
-                chars = [ch for ch in word.word if not ch.isspace()]
-                if not chars:
-                    continue
-                word_start = max(start, word.start)
-                word_end = min(end, word.end)
-                if word_end <= word_start:
-                    continue
-                word_step = (word_end - word_start) / len(chars)
-                cursor = word_start
-                for idx, ch in enumerate(chars):
-                    char_start = cursor
-                    char_end = word_start + word_step * (idx + 1) if idx < len(chars) - 1 else word_end
-                    center = (char_start + char_end) / 2.0
-                    pitch = self._sample_envelope(envelope_points, envelope_times, center)
-                    timeline.append(CharacterTiming(char=ch, start=char_start, end=char_end, pitch=pitch))
-                    cursor = char_end
-            if len(timeline) == total:
-                return timeline
-
-        cursor = start
-        for idx, ch in enumerate(cleaned):
-            char_start = cursor
-            char_end = start + step * (idx + 1) if idx < total - 1 else end
-            center = (char_start + char_end) / 2.0
-            pitch = self._sample_envelope(envelope_points, envelope_times, center)
-            timeline.append(CharacterTiming(char=ch, start=char_start, end=char_end, pitch=pitch))
-            cursor = char_end
-        return timeline
-
-    def _sample_envelope(
-        self,
-        envelope: Sequence[tuple[float, float]],
-        times: Sequence[float],
-        time_point: float,
-    ) -> float:
-        if not envelope:
-            return 0.0
-        idx = bisect_left(times, time_point)
-        if idx <= 0:
-            return envelope[0][1]
-        if idx >= len(envelope):
-            return envelope[-1][1]
-        t0, v0 = envelope[idx - 1]
-        t1, v1 = envelope[idx]
-        if t1 == t0:
-            return v0
-        ratio = (time_point - t0) / (t1 - t0)
-        return v0 + ratio * (v1 - v0)
+def _build_character_map(text: str, start: float, end: float) -> List[CharacterTiming]:
+    cleaned = [ch for ch in text if not ch.isspace()]
+    if not cleaned or end <= start:
+        return []
+    total = len(cleaned)
+    duration = end - start
+    step = duration / total
+    timeline: List[CharacterTiming] = []
+    cursor = start
+    for idx, ch in enumerate(cleaned):
+        char_start = cursor
+        char_end = start + step * (idx + 1) if idx < total - 1 else end
+        timeline.append(CharacterTiming(char=ch, start=char_start, end=char_end, pitch=0.0))
+        cursor = char_end
+    return timeline

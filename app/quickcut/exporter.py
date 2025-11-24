@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import subprocess
+import tempfile
 from pathlib import Path
 from typing import Callable, Iterable, List, Optional, Tuple
 
@@ -35,6 +36,10 @@ def export_visible_segments(
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
+    with tempfile.NamedTemporaryFile(mode="w+", delete=False, suffix=".txt", encoding="utf-8") as tmp_filter:
+        tmp_filter.write(filter_complex)
+        filter_script_path = Path(tmp_filter.name)
+
     cmd = [
         "ffmpeg",
         "-y",
@@ -43,12 +48,14 @@ def export_visible_segments(
         "error",
         "-i",
         str(media_path),
-        "-filter_complex",
-        filter_complex,
+        "-filter_complex_script",
+        str(filter_script_path),
         "-map",
         "[v]",
         "-map",
         "[a]",
+        "-c:v",
+        "libx264",
         "-preset",
         preset,
         "-crf",
@@ -62,7 +69,10 @@ def export_visible_segments(
 
     if progress_cb:
         progress_cb("FFmpeg 正在輸出影片…")
-    completed = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        completed = subprocess.run(cmd, capture_output=True, text=True)
+    finally:
+        filter_script_path.unlink(missing_ok=True)
     if completed.returncode != 0:
         raise RuntimeError(f"輸出失敗:\n{completed.stderr.strip()}")
     return output_path

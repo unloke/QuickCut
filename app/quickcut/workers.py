@@ -6,7 +6,7 @@ from PyQt5.QtCore import QObject, QRunnable, pyqtSignal as Signal
 
 from .models import AnalysisResult, QuickEditSettings, TranscriptionResult
 from .pipeline import AnalyzerPipeline
-from .transcription import TranscriptionEngine
+from .transcription import VoskTranscriber
 
 
 class WorkerSignals(QObject):
@@ -16,18 +16,18 @@ class WorkerSignals(QObject):
 
 
 class AnalyzerTask(QRunnable):
-    """Background task that performs analysis and transcription sequentially."""
+    """Background task that runs analysis plus verbatim transcription."""
 
     def __init__(
         self,
         pipeline: AnalyzerPipeline,
-        transcription: TranscriptionEngine,
+        transcriber: VoskTranscriber,
         media_path: Path,
         settings: QuickEditSettings,
     ):
         super().__init__()
         self.pipeline = pipeline
-        self.transcription = transcription
+        self.transcriber = transcriber
         self.media_path = Path(media_path)
         self.settings = settings
         self.signals = WorkerSignals()
@@ -39,16 +39,13 @@ class AnalyzerTask(QRunnable):
                 self.settings,
                 progress_cb=self.signals.progress.emit,
             )
-            transcription_result: TranscriptionResult = self.transcription.transcribe(
-                analysis.speech_wav_path,
-                analysis.speech_time_map,
-                analysis.envelope,
-                analysis.low_segments,
-                self.settings.low_energy_threshold_db,
+            transcription: TranscriptionResult = self.transcriber.transcribe(
+                analysis.wav_path,
+                analysis.speech_segments,
             )
             payload = {
                 "analysis": analysis,
-                "transcription": transcription_result,
+                "transcription": transcription,
                 "settings": self.settings,
             }
             self.signals.finished.emit(payload)
